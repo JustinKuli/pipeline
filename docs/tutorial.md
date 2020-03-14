@@ -237,7 +237,7 @@ spec:
       value: Dockerfile
     - name: pathToContext
       value: /workspace/docker-source/examples/microservices/leeroy-web #configure: may change according to your source
-  resource:
+  resources:
     inputs:
       - name: docker-source
         resourceRef:
