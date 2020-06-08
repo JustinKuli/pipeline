@@ -18,6 +18,7 @@ package taskrun
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -45,8 +46,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"knative.dev/pkg/apis"
+	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/tracker"
 )
@@ -55,6 +58,11 @@ const (
 	// taskRunAgentName defines logging agent name for TaskRun Controller
 	taskRunAgentName = "taskrun-controller"
 )
+
+type configStore interface {
+	ToContext(ctx context.Context) context.Context
+	WatchConfigs(w configmap.Watcher)
+}
 
 // Reconciler implements controller.Reconciler for Configuration resources.
 type Reconciler struct {
@@ -71,6 +79,7 @@ type Reconciler struct {
 	timeoutHandler    *reconciler.TimeoutSet
 	metrics           *Recorder
 	pvcHandler        volumeclaim.PvcHandler
+	configStore       configStore
 }
 
 // Check that our Reconciler implements controller.Reconciler
@@ -87,6 +96,8 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 		c.Logger.Errorf("invalid resource key: %s", key)
 		return nil
 	}
+
+	ctx = c.configStore.ToContext(ctx)
 
 	// Get the Task Run resource with this namespace/name
 	original, err := c.taskRunLister.TaskRuns(namespace).Get(name)
@@ -117,7 +128,7 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 		// We also want to send the "Started" event as soon as possible for anyone who may be waiting
 		// on the event to perform user facing initialisations, such has reset a CI check status
 		afterCondition := tr.Status.GetCondition(apis.ConditionSucceeded)
-		events.EmitEvent(c.Recorder, nil, afterCondition, tr)
+		events.Emit(c.Recorder, nil, afterCondition, tr)
 	}
 
 	// If the TaskRun is complete, run some post run fixtures when applicable
@@ -210,9 +221,9 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 
 func (c *Reconciler) finishReconcileUpdateEmitEvents(tr, original *v1beta1.TaskRun, beforeCondition *apis.Condition, previousError error) error {
 	afterCondition := tr.Status.GetCondition(apis.ConditionSucceeded)
-	events.EmitEvent(c.Recorder, beforeCondition, afterCondition, tr)
+	events.Emit(c.Recorder, beforeCondition, afterCondition, tr)
 	err := c.updateStatusLabelsAndAnnotations(tr, original)
-	events.EmitErrorEvent(c.Recorder, err, tr)
+	events.EmitError(c.Recorder, err, tr)
 	return multierror.Append(previousError, err).ErrorOrNil()
 }
 
@@ -229,7 +240,7 @@ func (c *Reconciler) getTaskResolver(tr *v1beta1.TaskRun) (*resources.LocalTaskR
 	return resolver, kind
 }
 
-// `prepare` fetches resources the taskrun depends on, runs validation and convertion
+// `prepare` fetches resources the taskrun depends on, runs validation and conversion
 // It may report errors back to Reconcile, it updates the taskrun status in case of
 // error but it does not sync updates back to etcd. It does not emit events.
 // All errors returned by `prepare` are always handled by `Reconcile`, so they don't cause
@@ -374,7 +385,7 @@ func (c *Reconciler) reconcile(ctx context.Context, tr *v1beta1.TaskRun,
 			tr.Spec.Workspaces = taskRunWorkspaces
 		}
 
-		pod, err = c.createPod(tr, rtr)
+		pod, err = c.createPod(ctx, tr, rtr)
 		if err != nil {
 			c.handlePodCreationError(tr, err)
 			return nil
@@ -399,7 +410,7 @@ func (c *Reconciler) reconcile(ctx context.Context, tr *v1beta1.TaskRun,
 	// Convert the Pod's status to the equivalent TaskRun Status.
 	tr.Status = podconvert.MakeTaskRunStatus(c.Logger, *tr, pod, *taskSpec)
 
-	if err := updateTaskRunResourceResult(tr, pod.Status); err != nil {
+	if err := updateTaskRunResourceResult(tr, *pod); err != nil {
 		return err
 	}
 
@@ -454,6 +465,7 @@ func (c *Reconciler) updateStatus(taskrun *v1beta1.TaskRun) (*v1beta1.TaskRun, e
 		return nil, fmt.Errorf("error getting TaskRun %s when updating status: %w", taskrun.Name, err)
 	}
 	if !reflect.DeepEqual(taskrun.Status, newtaskrun.Status) {
+		newtaskrun = newtaskrun.DeepCopy()
 		newtaskrun.Status = taskrun.Status
 		return c.PipelineClientSet.TektonV1beta1().TaskRuns(taskrun.Namespace).UpdateStatus(newtaskrun)
 	}
@@ -466,9 +478,17 @@ func (c *Reconciler) updateLabelsAndAnnotations(tr *v1beta1.TaskRun) (*v1beta1.T
 		return nil, fmt.Errorf("error getting TaskRun %s when updating labels/annotations: %w", tr.Name, err)
 	}
 	if !reflect.DeepEqual(tr.ObjectMeta.Labels, newTr.ObjectMeta.Labels) || !reflect.DeepEqual(tr.ObjectMeta.Annotations, newTr.ObjectMeta.Annotations) {
-		newTr.ObjectMeta.Labels = tr.ObjectMeta.Labels
-		newTr.ObjectMeta.Annotations = tr.ObjectMeta.Annotations
-		return c.PipelineClientSet.TektonV1beta1().TaskRuns(tr.Namespace).Update(newTr)
+		mergePatch := map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"labels":      tr.ObjectMeta.Labels,
+				"annotations": tr.ObjectMeta.Annotations,
+			},
+		}
+		patch, err := json.Marshal(mergePatch)
+		if err != nil {
+			return nil, err
+		}
+		return c.PipelineClientSet.TektonV1beta1().TaskRuns(tr.Namespace).Patch(tr.Name, types.MergePatchType, patch)
 	}
 	return newTr, nil
 }
@@ -533,7 +553,7 @@ func (c *Reconciler) failTaskRun(tr *v1beta1.TaskRun, reason, message string) er
 
 // createPod creates a Pod based on the Task's configuration, with pvcName as a volumeMount
 // TODO(dibyom): Refactor resource setup/substitution logic to its own function in the resources package
-func (c *Reconciler) createPod(tr *v1beta1.TaskRun, rtr *resources.ResolvedTaskResources) (*corev1.Pod, error) {
+func (c *Reconciler) createPod(ctx context.Context, tr *v1beta1.TaskRun, rtr *resources.ResolvedTaskResources) (*corev1.Pod, error) {
 	ts := rtr.TaskSpec.DeepCopy()
 	inputResources, err := resourceImplBinding(rtr.Inputs, c.Images)
 	if err != nil {
@@ -589,12 +609,12 @@ func (c *Reconciler) createPod(tr *v1beta1.TaskRun, rtr *resources.ResolvedTaskR
 	}
 
 	// Check if the HOME env var of every Step should be set to /tekton/home.
-	shouldOverrideHomeEnv := podconvert.ShouldOverrideHomeEnv(c.KubeClientSet)
+	shouldOverrideHomeEnv := podconvert.ShouldOverrideHomeEnv(ctx)
 
 	// Apply creds-init path substitutions.
 	ts = resources.ApplyCredentialsPath(ts, podconvert.CredentialsPath(shouldOverrideHomeEnv))
 
-	pod, err := podconvert.MakePod(c.Images, tr, *ts, c.KubeClientSet, c.entrypointCache, shouldOverrideHomeEnv)
+	pod, err := podconvert.MakePod(ctx, c.Images, tr, *ts, c.KubeClientSet, c.entrypointCache, shouldOverrideHomeEnv)
 	if err != nil {
 		return nil, fmt.Errorf("translating TaskSpec to Pod: %w", err)
 	}
@@ -604,9 +624,11 @@ func (c *Reconciler) createPod(tr *v1beta1.TaskRun, rtr *resources.ResolvedTaskR
 
 type DeletePod func(podName string, options *metav1.DeleteOptions) error
 
-func updateTaskRunResourceResult(taskRun *v1beta1.TaskRun, podStatus corev1.PodStatus) error {
+func updateTaskRunResourceResult(taskRun *v1beta1.TaskRun, pod corev1.Pod) error {
+	podconvert.SortContainerStatuses(&pod)
+
 	if taskRun.IsSuccessful() {
-		for idx, cs := range podStatus.ContainerStatuses {
+		for idx, cs := range pod.Status.ContainerStatuses {
 			if cs.State.Terminated != nil {
 				msg := cs.State.Terminated.Message
 				r, err := termination.ParseMessage(msg)
@@ -618,6 +640,7 @@ func updateTaskRunResourceResult(taskRun *v1beta1.TaskRun, podStatus corev1.PodS
 				taskRun.Status.ResourcesResult = append(taskRun.Status.ResourcesResult, pipelineResourceResults...)
 			}
 		}
+		taskRun.Status.TaskRunResults = removeDuplicateResults(taskRun.Status.TaskRunResults)
 	}
 	return nil
 }
@@ -640,6 +663,21 @@ func getResults(results []v1beta1.PipelineResourceResult) ([]v1beta1.TaskRunResu
 		}
 	}
 	return taskResults, pipelineResourceResults
+}
+
+func removeDuplicateResults(taskRunResult []v1beta1.TaskRunResult) []v1beta1.TaskRunResult {
+	uniq := make([]v1beta1.TaskRunResult, 0)
+	latest := make(map[string]v1beta1.TaskRunResult, 0)
+	for _, res := range taskRunResult {
+		if _, seen := latest[res.Name]; !seen {
+			uniq = append(uniq, res)
+		}
+		latest[res.Name] = res
+	}
+	for i, res := range uniq {
+		uniq[i] = latest[res.Name]
+	}
+	return uniq
 }
 
 func isExceededResourceQuotaError(err error) bool {

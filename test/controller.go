@@ -41,6 +41,7 @@ import (
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	fakekubeclientset "k8s.io/client-go/kubernetes/fake"
 	fakekubeclient "knative.dev/pkg/client/injection/kube/client/fake"
+	fakeconfigmapinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/configmap/fake"
 	fakepodinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/pod/fake"
 	"knative.dev/pkg/controller"
 )
@@ -57,6 +58,7 @@ type Data struct {
 	Conditions        []*v1alpha1.Condition
 	Pods              []*corev1.Pod
 	Namespaces        []*corev1.Namespace
+	ConfigMaps        []*corev1.ConfigMap
 }
 
 // Clients holds references to clients which are useful for reconciler tests.
@@ -76,12 +78,14 @@ type Informers struct {
 	PipelineResource resourceinformersv1alpha1.PipelineResourceInformer
 	Condition        informersv1alpha1.ConditionInformer
 	Pod              coreinformers.PodInformer
+	ConfigMap        coreinformers.ConfigMapInformer
 }
 
 // Assets holds references to the controller, logs, clients, and informers.
 type Assets struct {
 	Controller *controller.Impl
 	Clients    Clients
+	Informers  Informers
 }
 
 // SeedTestData returns Clients and Informers populated with the
@@ -103,9 +107,11 @@ func SeedTestData(t *testing.T, ctx context.Context, d Data) (Clients, Informers
 		PipelineResource: fakeresourceinformer.Get(ctx),
 		Condition:        fakeconditioninformer.Get(ctx),
 		Pod:              fakepodinformer.Get(ctx),
+		ConfigMap:        fakeconfigmapinformer.Get(ctx),
 	}
 
 	for _, pr := range d.PipelineRuns {
+		pr := pr.DeepCopy() // Avoid assumptions that the informer's copy is modified.
 		if err := i.PipelineRun.Informer().GetIndexer().Add(pr); err != nil {
 			t.Fatal(err)
 		}
@@ -114,6 +120,7 @@ func SeedTestData(t *testing.T, ctx context.Context, d Data) (Clients, Informers
 		}
 	}
 	for _, p := range d.Pipelines {
+		p := p.DeepCopy() // Avoid assumptions that the informer's copy is modified.
 		if err := i.Pipeline.Informer().GetIndexer().Add(p); err != nil {
 			t.Fatal(err)
 		}
@@ -122,6 +129,7 @@ func SeedTestData(t *testing.T, ctx context.Context, d Data) (Clients, Informers
 		}
 	}
 	for _, tr := range d.TaskRuns {
+		tr := tr.DeepCopy() // Avoid assumptions that the informer's copy is modified.
 		if err := i.TaskRun.Informer().GetIndexer().Add(tr); err != nil {
 			t.Fatal(err)
 		}
@@ -130,6 +138,7 @@ func SeedTestData(t *testing.T, ctx context.Context, d Data) (Clients, Informers
 		}
 	}
 	for _, ta := range d.Tasks {
+		ta := ta.DeepCopy() // Avoid assumptions that the informer's copy is modified.
 		if err := i.Task.Informer().GetIndexer().Add(ta); err != nil {
 			t.Fatal(err)
 		}
@@ -138,6 +147,7 @@ func SeedTestData(t *testing.T, ctx context.Context, d Data) (Clients, Informers
 		}
 	}
 	for _, ct := range d.ClusterTasks {
+		ct := ct.DeepCopy() // Avoid assumptions that the informer's copy is modified.
 		if err := i.ClusterTask.Informer().GetIndexer().Add(ct); err != nil {
 			t.Fatal(err)
 		}
@@ -146,6 +156,7 @@ func SeedTestData(t *testing.T, ctx context.Context, d Data) (Clients, Informers
 		}
 	}
 	for _, r := range d.PipelineResources {
+		r := r.DeepCopy() // Avoid assumptions that the informer's copy is modified.
 		if err := i.PipelineResource.Informer().GetIndexer().Add(r); err != nil {
 			t.Fatal(err)
 		}
@@ -154,6 +165,7 @@ func SeedTestData(t *testing.T, ctx context.Context, d Data) (Clients, Informers
 		}
 	}
 	for _, cond := range d.Conditions {
+		cond := cond.DeepCopy() // Avoid assumptions that the informer's copy is modified.
 		if err := i.Condition.Informer().GetIndexer().Add(cond); err != nil {
 			t.Fatal(err)
 		}
@@ -162,6 +174,7 @@ func SeedTestData(t *testing.T, ctx context.Context, d Data) (Clients, Informers
 		}
 	}
 	for _, p := range d.Pods {
+		p := p.DeepCopy() // Avoid assumptions that the informer's copy is modified.
 		if err := i.Pod.Informer().GetIndexer().Add(p); err != nil {
 			t.Fatal(err)
 		}
@@ -170,7 +183,16 @@ func SeedTestData(t *testing.T, ctx context.Context, d Data) (Clients, Informers
 		}
 	}
 	for _, n := range d.Namespaces {
+		n := n.DeepCopy() // Avoid assumptions that the informer's copy is modified.
 		if _, err := c.Kube.CoreV1().Namespaces().Create(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, cm := range d.ConfigMaps {
+		if err := i.ConfigMap.Informer().GetIndexer().Add(cm); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Kube.CoreV1().ConfigMaps(cm.Namespace).Create(cm); err != nil {
 			t.Fatal(err)
 		}
 	}
